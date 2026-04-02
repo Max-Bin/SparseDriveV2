@@ -104,8 +104,19 @@ def _flatten_config(cfg: DictConfig, max_depth: int = 3) -> dict:
 
 
 def setup_mlflow(cfg: DictConfig) -> MLFlowLogger:
-    """Initialize MLflow experiment tracking."""
-    tracking_uri = cfg.get("mlflow_tracking_uri", f"file:{cfg.output_dir}/mlruns")
+    """Initialize MLflow experiment tracking with SQLite backend.
+
+    Directory structure:
+        exp/mlflow/
+        ├── mlflow.db          # SQLite database (metrics, params, tags, runs)
+        └── artifacts/         # Artifacts (models, configs, checkpoints)
+    """
+    mlflow_root = Path(cfg.output_dir) / "mlflow"
+    mlflow_root.mkdir(parents=True, exist_ok=True)
+    (mlflow_root / "artifacts").mkdir(exist_ok=True)
+
+    tracking_uri = cfg.get("mlflow_tracking_uri", f"sqlite:///{mlflow_root}/mlflow.db")
+    artifact_location = cfg.get("mlflow_artifact_uri", str(mlflow_root / "artifacts"))
     experiment_name = cfg.get("experiment_name", "sparsedrive-training")
 
     mlflow.set_tracking_uri(tracking_uri)
@@ -120,6 +131,7 @@ def setup_mlflow(cfg: DictConfig) -> MLFlowLogger:
     mlf_logger = MLFlowLogger(
         experiment_name=experiment_name,
         tracking_uri=tracking_uri,
+        artifact_location=artifact_location,
         log_model=False,  # We handle model logging manually for more control
     )
 
