@@ -23,20 +23,27 @@ class SparseBackbone(nn.Module):
                 True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7
             )
 
-        assert config.image_architecture in ["resnet34"], f"Image architecture {config.image_architecture} not supported."
+        backbone_channels = {
+            "resnet34": [64, 128, 256, 512],
+            "resnet50": [256, 512, 1024, 2048],
+        }
+        assert config.image_architecture in backbone_channels, \
+            f"Image architecture {config.image_architecture} not supported."
+        in_channels = backbone_channels[config.image_architecture]
+
         self.img_backbone = timm.create_model(
             config.image_architecture, pretrained=True, features_only=True,
-            pretrained_cfg_overlay=dict(file=config.bkb_path), 
+            pretrained_cfg_overlay=dict(file=config.bkb_path),
             out_indices=(1, 2, 3, 4)[-config.num_levels:]
         )
         if self.with_img_neck:
             self.img_neck = FPN(
-                in_channels_list=[64,128,256,512][-config.num_levels:],
+                in_channels_list=in_channels[-config.num_levels:],
                 out_channels=self.embed_dims,
             )
         else:
             self.img_neck = nn.Conv2d(
-                512,
+                in_channels[-1],
                 config.d_model,
                 kernel_size=(3, 3),
                 stride=1,

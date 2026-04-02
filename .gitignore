@@ -34,3 +34,11 @@ vis/
 
 build/
 *.so
+
+# Claude Code
+CLAUDE.md
+.claude/
+.codex
+
+# Environment
+.venv/

@@ -1,0 +1,15 @@
+_target_: navsim.agents.sparsedrive.sparsedrive_agent_tacarla.SparseDriveAgentTaCarla
+_convert_: 'all'
+
+trajectory_sampling:
+  _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+  _convert_: 'all'
+  time_horizon: 3
+  interval_length: 0.5
+
+config:
+  _target_: navsim.agents.sparsedrive.sparsedrive_config_tacarla.SparseDriveConfigTaCarla
+  _convert_: 'all'
+
+checkpoint_path: null
+lr: 4e-4

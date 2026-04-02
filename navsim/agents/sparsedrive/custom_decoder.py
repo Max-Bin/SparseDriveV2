@@ -141,13 +141,14 @@ class CustomTransformerDecoderLayer(nn.Module):
                 nn.ReLU(),
                 nn.Linear(d_ffn, 1),
             )
-            self.metric_heads = nn.ModuleDict()
-            for metric in self._config.metrics:
-                self.metric_heads[metric] = nn.Sequential(
-                    nn.Linear(d_model, d_ffn),
-                    nn.ReLU(),
-                    nn.Linear(d_ffn, 1),
-                )
+            if self._config.metric_loss_weight > 0:
+                self.metric_heads = nn.ModuleDict()
+                for metric in self._config.metrics:
+                    self.metric_heads[metric] = nn.Sequential(
+                        nn.Linear(d_model, d_ffn),
+                        nn.ReLU(),
+                        nn.Linear(d_ffn, 1),
+                    )
 
     def forward(self, path_embed, vel_embed, path_vocab, vel_vocab, traj_vocab, traj_mask,
                 camera_feature, status_encoding, targets,
@@ -230,8 +231,9 @@ class CustomTransformerDecoderLayer(nn.Module):
             traj_emed = self.t_norm2(traj_emed)
             traj_scores = self.traj_mlp(traj_emed).squeeze(-1)
             metric_logit = {}
-            for metric in self._config.metrics:
-                metric_logit[metric] = self.metric_heads[metric](traj_emed).squeeze(-1)
+            if self._config.metric_loss_weight > 0:
+                for metric in self._config.metrics:
+                    metric_logit[metric] = self.metric_heads[metric](traj_emed).squeeze(-1)
 
         loss_dict = {}
         if self.training:
@@ -268,52 +270,56 @@ class CustomTransformerDecoderLayer(nn.Module):
                 loss_dict[f'traj_loss_{self.decoder_idx}'] = traj_loss
 
                 ## metric
-                trajectory = filter_traj_vocab.flatten(1,2)
-                pdm_token_paths = []
-                for token_path in targets["token_path"]:
-                    pdm_token_path = token_path.replace("data_cache_navtrain", f"metric_cache_navtrain{self._config.dataset_version}")
-                    pdm_token_path_parts = pdm_token_path.split('/')
-                    pdm_token_path_parts.insert(-1, 'unknown')
-                    pdm_token_path = '/'.join(pdm_token_path_parts) + "/metric_cache.pkl"
-                    pdm_token_paths.append(pdm_token_path)
-                if self._config.dataset_version == "v1":
-                    sub_scores = get_pdm_score_v1(trajectory, pdm_token_paths)
-                elif self._config.dataset_version == "v2":
-                    sub_scores = get_pdm_score_v2(trajectory, pdm_token_paths)
-                for metric in self._config.metrics:
-                    metric_pred = metric_logit[metric]
-                    metric_gt = torch.tensor(np.stack([sub_score[metric] for sub_score in sub_scores])).to(metric_pred)
-                    metric_gt[metric_gt == 0.5] = 0.0
-                    metric_loss = F.binary_cross_entropy_with_logits(metric_pred, metric_gt)
-                    loss_dict[f'{metric}_loss_{self.decoder_idx}'] = metric_loss * self._config.metric_loss_weight
+                if self._config.metric_loss_weight > 0:
+                    trajectory = filter_traj_vocab.flatten(1,2)
+                    pdm_token_paths = []
+                    for token_path in targets["token_path"]:
+                        pdm_token_path = token_path.replace("data_cache_navtrain", f"metric_cache_navtrain{self._config.dataset_version}")
+                        pdm_token_path_parts = pdm_token_path.split('/')
+                        pdm_token_path_parts.insert(-1, 'unknown')
+                        pdm_token_path = '/'.join(pdm_token_path_parts) + "/metric_cache.pkl"
+                        pdm_token_paths.append(pdm_token_path)
+                    if self._config.dataset_version == "v1":
+                        sub_scores = get_pdm_score_v1(trajectory, pdm_token_paths)
+                    elif self._config.dataset_version == "v2":
+                        sub_scores = get_pdm_score_v2(trajectory, pdm_token_paths)
+                    for metric in self._config.metrics:
+                        metric_pred = metric_logit[metric]
+                        metric_gt = torch.tensor(np.stack([sub_score[metric] for sub_score in sub_scores])).to(metric_pred)
+                        metric_gt[metric_gt == 0.5] = 0.0
+                        metric_loss = F.binary_cross_entropy_with_logits(metric_pred, metric_gt)
+                        loss_dict[f'{metric}_loss_{self.decoder_idx}'] = metric_loss * self._config.metric_loss_weight
         
         output = {}
         if self.decoder_idx == self._config.decoder_num_layers - 1:
-            if self._config.dataset_version == "v1":
-                scores = (
-                    metric_logit["no_at_fault_collisions"].sigmoid() * 
-                    metric_logit["drivable_area_compliance"].sigmoid()
-                ) * (
-                    5 * metric_logit["time_to_collision_within_bound"].sigmoid() +
-                    5 * metric_logit["ego_progress"].sigmoid()  +
-                    2 * metric_logit["comfort"].sigmoid()
-                )
-            if self._config.dataset_version == "v2":
-                scores = (
-                    metric_logit["no_at_fault_collisions"].sigmoid() * 
-                    metric_logit["drivable_area_compliance"].sigmoid() *
-                    metric_logit["driving_direction_compliance"].sigmoid() *
-                    metric_logit["traffic_light_compliance"].sigmoid()
-                ) * (
-                    5 * metric_logit["time_to_collision_within_bound"].sigmoid() +
-                    5 * metric_logit["ego_progress"].sigmoid()  +
-                    2 * metric_logit["lane_keeping"].sigmoid() +
-                    2 * metric_logit["history_comfort"].sigmoid()
-                )
+            if self._config.metric_loss_weight > 0 and metric_logit:
+                if self._config.dataset_version == "v1":
+                    scores = (
+                        metric_logit["no_at_fault_collisions"].sigmoid() *
+                        metric_logit["drivable_area_compliance"].sigmoid()
+                    ) * (
+                        5 * metric_logit["time_to_collision_within_bound"].sigmoid() +
+                        5 * metric_logit["ego_progress"].sigmoid()  +
+                        2 * metric_logit["comfort"].sigmoid()
+                    )
+                elif self._config.dataset_version == "v2":
+                    scores = (
+                        metric_logit["no_at_fault_collisions"].sigmoid() *
+                        metric_logit["drivable_area_compliance"].sigmoid() *
+                        metric_logit["driving_direction_compliance"].sigmoid() *
+                        metric_logit["traffic_light_compliance"].sigmoid()
+                    ) * (
+                        5 * metric_logit["time_to_collision_within_bound"].sigmoid() +
+                        5 * metric_logit["ego_progress"].sigmoid()  +
+                        2 * metric_logit["lane_keeping"].sigmoid() +
+                        2 * metric_logit["history_comfort"].sigmoid()
+                    )
+            else:
+                scores = traj_scores
 
             bs_indices = torch.arange(scores.shape[0], device=scores.device)
             mode_indices = scores.argmax(1)
-            trajectory = filter_traj_vocab.flatten(1, 2)[bs_indices, mode_indices] 
+            trajectory = filter_traj_vocab.flatten(1, 2)[bs_indices, mode_indices]
             output["trajectory"] = trajectory
 
         return (filter_path_embed, filter_vel_embed, filter_path_vocab, filter_vel_vocab, filter_traj_vocab, filter_traj_mask), output, loss_dict
