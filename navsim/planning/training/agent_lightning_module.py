@@ -1,7 +1,9 @@
 import os
+import logging
+from pathlib import Path
 
+import mlflow
 import pytorch_lightning as pl
-
 import torch
 from torch import Tensor
 from typing import Dict, Tuple
@@ -9,24 +11,18 @@ from typing import Dict, Tuple
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.common.dataclasses import Trajectory
 
+logger = logging.getLogger(__name__)
+
+
 class AgentLightningModule(pl.LightningModule):
-    """Pytorch lightning wrapper for learnable agent."""
+    """Pytorch lightning wrapper for learnable agent with MLflow integration."""
 
     def __init__(self, agent: AbstractAgent):
-        """
-        Initialise the lightning module wrapper.
-        :param agent: agent interface in NAVSIM
-        """
         super().__init__()
         self.agent = agent
+        self._best_train_loss = float("inf")
 
     def _step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], logging_prefix: str) -> Tensor:
-        """
-        Propagates the model forward and backwards and computes/logs losses and metrics.
-        :param batch: tuple of dictionaries for feature and target tensors (batched)
-        :param logging_prefix: prefix where to log step
-        :return: scalar loss
-        """
         features, targets, token = batch
         targets["token"] = token
         prediction = self.agent.forward(features, targets)
@@ -36,31 +32,49 @@ class AgentLightningModule(pl.LightningModule):
         return loss_dict['loss']
 
     def training_step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], batch_idx: int) -> Tensor:
-        """
-        Step called on training samples
-        :param batch: tuple of dictionaries for feature and target tensors (batched)
-        :param batch_idx: index of batch (ignored)
-        :return: scalar loss
-        """
         loss = self._step(batch, "train")
+        # Log learning rate
+        optimizer = self.optimizers()
+        if optimizer is not None:
+            for i, pg in enumerate(optimizer.param_groups):
+                self.log(f"train/lr_group{i}", pg["lr"], on_step=True, on_epoch=False)
         return loss
 
     def validation_step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], batch_idx: int):
-        """
-        Step called on validation samples
-        :param batch: tuple of dictionaries for feature and target tensors (batched)
-        :param batch_idx: index of batch (ignored)
-        :return: scalar loss
-        """
         return self._step(batch, "val")
 
+    def on_train_epoch_end(self):
+        """Log epoch-level summary metrics to MLflow."""
+        epoch = self.current_epoch
+        if mlflow.active_run():
+            # Log GPU memory stats if available
+            if torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    mem_alloc = torch.cuda.memory_allocated(i) / 1e9
+                    mem_reserved = torch.cuda.memory_reserved(i) / 1e9
+                    mlflow.log_metrics({
+                        f"gpu{i}/memory_allocated_gb": mem_alloc,
+                        f"gpu{i}/memory_reserved_gb": mem_reserved,
+                    }, step=epoch)
+
+    def on_train_end(self):
+        """Log final model to MLflow with artifact tracking."""
+        if not mlflow.active_run():
+            return
+
+        if self.global_rank != 0:
+            return
+
+        try:
+            mlflow.pytorch.log_model(
+                self.agent._sparsedrive_model,
+                artifact_path="final_model",
+            )
+            logger.info("Logged final model to MLflow")
+        except Exception as e:
+            logger.warning(f"Failed to log final model to MLflow: {e}")
+
     def predict_step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], batch_idx: int):
-        """
-        Step called on validation samples
-        :param batch: tuple of dictionaries for feature and target tensors (batched)
-        :param batch_idx: index of batch (ignored)
-        :return: scalar loss
-        """
         features, targets, tokens = batch
         predictions, loss_dict = self.agent.forward(features, None)
         trajectory = predictions["trajectory"]
@@ -71,9 +85,7 @@ class AgentLightningModule(pl.LightningModule):
                 trajectory[i].cpu().numpy(),
                 self.agent._config.trajectory_sampling,
             )
-
         return results
-    
+
     def configure_optimizers(self):
-        """Inherited, see superclass."""
         return self.agent.get_optimizers()
