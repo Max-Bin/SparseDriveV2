@@ -1,7 +1,6 @@
 import logging
 from pathlib import Path
 
-import mlflow
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import Callback
 
@@ -9,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 class CheckpointCallback(Callback):
-    """Save periodic checkpoints and log them to MLflow as artifacts."""
+    """Save periodic checkpoints."""
 
     def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         trainer.strategy.barrier()
@@ -20,12 +19,5 @@ class CheckpointCallback(Callback):
 
         trainer.save_checkpoint(str(ckpt_path))
         trainer.print(f"[PDM] saved ckpt: {ckpt_path}")
-
-        # Log checkpoint to MLflow
-        if trainer.is_global_zero and mlflow.active_run():
-            try:
-                mlflow.log_artifact(str(ckpt_path), artifact_path="checkpoints")
-            except Exception as e:
-                logger.warning(f"Failed to log checkpoint to MLflow: {e}")
 
         trainer.strategy.barrier()

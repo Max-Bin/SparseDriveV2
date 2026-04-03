@@ -10,6 +10,8 @@
 #   TACARLA_CACHE=/path/to/tacarla_cache bash scripts/training/sparsedrive_tacarla.sh
 
 export HYDRA_FULL_ERROR=1
+export WANDB_ENTITY="${WANDB_ENTITY:?Set WANDB_ENTITY}"
+export WANDB_PROJECT="${WANDB_PROJECT:-SparseDriveV2}"
 
 config=default_training
 agent=sparsedrive_agent_tacarla
