@@ -76,11 +76,17 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
         :param idx: index of sample to load.
         :return: tuple of feature and target dictionary
         """
-        features, targets, token = self._load_scene_with_token(idx)
-        if hasattr(self._feature_builders[0], 'pipeline'):
-            features, targets, token = self._feature_builders[0].pipeline(features, targets, token, self.test_mode)
-
-        return (features, targets, token)
+        try:
+            features, targets, token = self._load_scene_with_token(idx)
+            if hasattr(self._feature_builders[0], 'pipeline'):
+                features, targets, token = self._feature_builders[0].pipeline(features, targets, token, self.test_mode)
+            return (features, targets, token)
+        except Exception as e:
+            # Fallback: return a different sample if this one fails (e.g. corrupted tar.gz)
+            import random
+            logger.warning(f"Failed to load sample {idx}: {e}, trying another")
+            alt_idx = random.randint(0, len(self.tokens) - 1)
+            return self.__getitem__(alt_idx)
 
     @staticmethod
     def _load_valid_caches(
