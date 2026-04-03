@@ -27,8 +27,9 @@ python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training.py \
     use_cache_without_dataset=True \
     force_cache_computation=False \
     cache_path=$TACARLA_CACHE \
-    dataloader.params.batch_size=6 \
+    dataloader.params.batch_size=12 \
     dataloader.params.num_workers=8 \
     dataloader.params.prefetch_factor=4 \
     trainer.params.max_epochs=100 \
+    +trainer.params.devices=8 \
     agent.lr=4e-4

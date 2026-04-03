@@ -52,10 +52,7 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
         self._cache_path = Path(cache_path)
         self.test_mode = test_mode
 
-        if log_names is not None:
-            self.log_names = [Path(log_name) for log_name in log_names if (self._cache_path / log_name).is_dir()]
-        else:
-            self.log_names = [log_name for log_name in self._cache_path.iterdir()]
+        self.log_names = log_names  # None means all
 
         self._feature_builders = feature_builders
         self._target_builders = target_builders
@@ -94,26 +91,62 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
     ) -> Dict[str, Path]:
         """
         Helper method to load valid cache paths.
-        :param cache_path: directory of training cache folder
-        :param feature_builders: list of feature builders
-        :param target_builders: list of target builders
-        :param log_names: list of log paths to load
-        :return: dictionary of tokens and sample paths as keys / values
+        First run: scans with find + saves index as pickle.
+        Subsequent runs: loads index in <1s.
         """
+        import subprocess
 
-        valid_cache_paths: Dict[str, Path] = {}
+        index_path = cache_path / "cache_index.pkl"
 
-        for log_name in tqdm(log_names, desc="Loading Valid Caches"):
-            log_path = cache_path / log_name
-            for token_path in log_path.iterdir():
-                found_caches: List[bool] = []
-                for builder in feature_builders + target_builders:
-                    data_dict_path = token_path / (builder.get_unique_name() + ".gz")
-                    found_caches.append(data_dict_path.is_file())
-                if all(found_caches):
-                    valid_cache_paths[token_path.name] = token_path
+        # Try loading existing index
+        if index_path.exists():
+            logger.info(f"Loading cache index from {index_path}")
+            with open(index_path, "rb") as f:
+                all_valid: Dict[str, Path] = pickle.load(f)
+            # Filter by log_names if specified
+            if log_names is not None and len(log_names) > 0:
+                log_set = set(str(ln) for ln in log_names)
+                filtered = {k: v for k, v in all_valid.items() if v.parent.name in log_set}
+            else:
+                filtered = all_valid
+            logger.info(f"Loaded {len(filtered)} cached scenes from index ({len(all_valid)} total)")
+            return filtered
 
-        return valid_cache_paths
+        # First run: scan with find and build index
+        required_files = set(b.get_unique_name() + ".gz" for b in feature_builders + target_builders)
+
+        logger.info(f"First run: scanning cache directory with find...")
+        result = subprocess.run(
+            ["find", str(cache_path), "-name", "*.gz", "-type", "f"],
+            capture_output=True, text=True, timeout=1800,
+        )
+        gz_paths = [p for p in result.stdout.strip().split("\n") if p]
+        logger.info(f"Found {len(gz_paths)} cached files")
+
+        from collections import defaultdict
+        token_files = defaultdict(set)
+        for gz in gz_paths:
+            p = Path(gz)
+            token_files[p.parent].add(p.name)
+
+        all_valid: Dict[str, Path] = {}
+        for token_path, files in token_files.items():
+            if required_files.issubset(files):
+                all_valid[token_path.name] = token_path
+
+        # Save index for next time
+        with open(index_path, "wb") as f:
+            pickle.dump(all_valid, f)
+        logger.info(f"Saved cache index: {len(all_valid)} scenes -> {index_path}")
+
+        # Filter by log_names
+        if log_names is not None and len(log_names) > 0:
+            log_set = set(str(ln) for ln in log_names)
+            filtered = {k: v for k, v in all_valid.items() if v.parent.name in log_set}
+        else:
+            filtered = all_valid
+
+        return filtered
 
     def _load_scene_with_token(self, idx: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """

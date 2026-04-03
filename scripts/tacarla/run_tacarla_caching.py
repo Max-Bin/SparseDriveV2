@@ -221,50 +221,109 @@ def process_episode(args):
 
 # ─── Clustering ──────────────────────────────────────────────────────────────
 
-def run_clustering(cache_path: Path):
-    from sklearn.cluster import KMeans
+def _load_one_target(gz_path):
+    """Load one target .gz file. Returns (path_or_None, velocity)."""
+    with gzip.open(gz_path, "rb") as fh:
+        data = pickle.load(fh)
+    vel = np.array(data["velocity"], dtype=np.float32)
+    if data["path_mask"].all():
+        p = np.array(data["path"], dtype=np.float32)
+        p[:, 2] = (p[:, 2] + np.pi) % (2 * np.pi) - np.pi
+        return p, vel
+    return None, vel
 
+
+def _gpu_kmeans(data: np.ndarray, k: int, n_iter: int = 100, n_init: int = 10):
+    """K-means on GPU using PyTorch. Much faster than sklearn for large data."""
+    import torch
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    X = torch.from_numpy(data).float().to(device)
+    n = X.shape[0]
+    best_centers = None
+    best_inertia = float("inf")
+
+    for attempt in range(n_init):
+        # K-means++ init
+        idx = [torch.randint(n, (1,)).item()]
+        for _ in range(1, k):
+            dists = torch.cdist(X, X[idx]).min(dim=1).values
+            probs = dists ** 2
+            probs /= probs.sum()
+            idx.append(torch.multinomial(probs, 1).item())
+        centers = X[idx].clone()
+
+        for _ in range(n_iter):
+            dists = torch.cdist(X, centers)
+            labels = dists.argmin(dim=1)
+            new_centers = torch.zeros_like(centers)
+            counts = torch.zeros(k, device=device)
+            new_centers.scatter_add_(0, labels.unsqueeze(1).expand(-1, X.shape[1]), X)
+            counts.scatter_add_(0, labels, torch.ones(n, device=device))
+            mask = counts > 0
+            new_centers[mask] /= counts[mask].unsqueeze(1)
+            new_centers[~mask] = centers[~mask]
+            if torch.allclose(centers, new_centers, atol=1e-6):
+                break
+            centers = new_centers
+
+        inertia = torch.cdist(X, centers).min(dim=1).values.pow(2).sum().item()
+        if inertia < best_inertia:
+            best_inertia = inertia
+            best_centers = centers
+
+        if (attempt + 1) % 3 == 0:
+            print(f"    init {attempt+1}/{n_init}, inertia={best_inertia:.2f}")
+
+    return best_centers.cpu().numpy()
+
+
+def run_clustering(cache_path: Path):
     K_PATH, K_VEL, DT = 1024, 256, 0.5
     out = Path("ckpt/kmeans_tacarla")
 
-    print("[Cluster] Loading targets...")
+    # ── Step 1: Parallel loading from cache ──
+    # Use subprocess find for fast file discovery on network storage
+    print("[Cluster] Scanning cache files (using find)...")
+    import subprocess
+    result = subprocess.run(
+        ["find", str(cache_path), "-name", "sparsedrive_target.gz", "-type", "f"],
+        capture_output=True, text=True, timeout=600,
+    )
+    gz_files = [Path(p) for p in result.stdout.strip().split("\n") if p]
+    print(f"[Cluster] Found {len(gz_files)} cached targets, loading with {min(32, len(gz_files))} workers...")
+
     paths, vels = [], []
-    for ep in tqdm(sorted(cache_path.iterdir()), desc="[Cluster] load"):
-        if not ep.is_dir():
-            continue
-        for td in ep.iterdir():
-            f = td / "sparsedrive_target.gz"
-            if not f.exists():
-                continue
-            with gzip.open(f, "rb") as fh:
-                data = pickle.load(fh)
-            if data["path_mask"].all():
-                p = np.array(data["path"])
-                p[:, 2] = (p[:, 2] + np.pi) % (2 * np.pi) - np.pi
+    with ProcessPoolExecutor(max_workers=32) as pool:
+        futs = [pool.submit(_load_one_target, f) for f in gz_files]
+        for fut in tqdm(as_completed(futs), total=len(futs), desc="[Cluster] load"):
+            p, v = fut.result()
+            if p is not None:
                 paths.append(p)
-            vels.append(np.array(data["velocity"]))
+            vels.append(v)
 
-    print(f"[Cluster] {len(paths)} paths, {len(vels)} velocities")
+    print(f"[Cluster] Loaded {len(paths)} paths, {len(vels)} velocities")
 
+    # ── Step 2: GPU K-means ──
     npts = paths[0].shape[0]
     pf = np.stack(paths).reshape(len(paths), -1)
-    print(f"[Cluster] K-means paths ({K_PATH} clusters)...")
-    pc = KMeans(K_PATH, n_init=10).fit(pf).cluster_centers_.reshape(K_PATH, npts, 3)
+    print(f"[Cluster] GPU K-means on paths ({K_PATH} clusters, {pf.shape})...")
+    pc = _gpu_kmeans(pf, K_PATH, n_iter=100, n_init=10).reshape(K_PATH, npts, 3)
     pc[:, :, 2] = (pc[:, :, 2] + np.pi) % (2 * np.pi) - np.pi
 
     vs = np.stack(vels)
-    print(f"[Cluster] K-means velocities ({K_VEL} clusters)...")
-    vc = KMeans(K_VEL, n_init=10).fit(vs).cluster_centers_
+    print(f"[Cluster] GPU K-means on velocities ({K_VEL} clusters, {vs.shape})...")
+    vc = _gpu_kmeans(vs, K_VEL, n_iter=100, n_init=10)
     nv = vc.shape[1]
 
+    # ── Step 3: Compose trajectory vocabulary (vectorized) ──
     print(f"[Cluster] Composing trajectory vocab ({K_PATH}x{K_VEL}x{nv}x3)...")
     traj = np.zeros((K_PATH, K_VEL, nv, 3))
     tmask = np.ones((K_PATH, K_VEL, nv))
     for i in range(K_PATH):
+        pad = np.vstack([np.zeros(3), pc[i]])
+        d = np.r_[0, np.linalg.norm(pad[1:, :2] - pad[:-1, :2], axis=-1).cumsum()]
         for j in range(K_VEL):
             td = np.cumsum(vc[j] * DT)
-            pad = np.vstack([np.zeros(3), pc[i]])
-            d = np.r_[0, np.linalg.norm(pad[1:, :2] - pad[:-1, :2], axis=-1).cumsum()]
             t = np.array([np.interp(td, d, pad[:, k]) for k in range(3)]).T
             t[:, 2] = (t[:, 2] + np.pi) % (2 * np.pi) - np.pi
             traj[i, j] = t
@@ -300,29 +359,38 @@ def main():
         parquets.extend(sorted(Path(ld).glob("*.parquet")))
     print(f"Total parquet files: {len(parquets)}")
 
+    # Pre-filter: skip episodes already cached (one fast listdir, no per-file checks)
+    cached_episodes = set()
+    if cache_path.exists():
+        cached_episodes = set(d.name for d in cache_path.iterdir() if d.is_dir())
+    to_process = [p for p in parquets if p.stem not in cached_episodes]
+    already_done = len(parquets) - len(to_process)
+    print(f"Already cached: {already_done}, to process: {len(to_process)}")
+
     cfg = {"subsample": args.subsample, "num_history": 1, "num_future": 6,
            "len_path": 15, "path_interval": 1.0, "vel_time_interval": 0.5}
 
-    tasks = [(p, sensor_root, cam_params, cache_path, cfg) for p in parquets]
+    tasks = [(p, sensor_root, cam_params, cache_path, cfg) for p in to_process]
 
     total_cached = 0
     total_skipped = 0
     total_errors = 0
 
-    with ProcessPoolExecutor(max_workers=args.workers) as pool:
-        futs = {pool.submit(process_episode, t): t[0].stem for t in tasks}
-        with tqdm(total=len(tasks), desc="Caching episodes", unit="ep") as pbar:
-            for fut in as_completed(futs):
-                ep, nc, ns, err = fut.result()
-                total_cached += nc
-                total_skipped += ns
-                if err:
-                    total_errors += 1
-                    tqdm.write(f"  ERR {ep}: {err}")
-                pbar.update(1)
-                pbar.set_postfix(cached=total_cached, skip=total_skipped, err=total_errors)
+    if tasks:
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            futs = {pool.submit(process_episode, t): t[0].stem for t in tasks}
+            with tqdm(total=len(tasks), desc="Caching episodes", unit="ep") as pbar:
+                for fut in as_completed(futs):
+                    ep, nc, ns, err = fut.result()
+                    total_cached += nc
+                    total_skipped += ns
+                    if err:
+                        total_errors += 1
+                        tqdm.write(f"  ERR {ep}: {err}")
+                    pbar.update(1)
+                    pbar.set_postfix(cached=total_cached, skip=total_skipped, err=total_errors)
 
-    print(f"\nDone: {total_cached} scenes cached, {total_skipped} skipped, {total_errors} errors")
+    print(f"\nDone: {total_cached} new scenes, {already_done} episodes already cached, {total_errors} errors")
 
     if args.cluster:
         print()

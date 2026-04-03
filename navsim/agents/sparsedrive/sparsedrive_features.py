@@ -144,12 +144,83 @@ class SparseDriveFeatureBuilder(AbstractFeatureBuilder):
 
     def load_images(self, results):
         image_paths = results["image_paths"]
-        imgs = [np.array(Image.open(str(image_path))) for image_path in image_paths]
+
+        # Check if all images exist on disk
+        missing = [i for i, p in enumerate(image_paths) if not Path(str(p)).exists()]
+
+        if not missing:
+            # All extracted: fast path
+            imgs = [np.array(Image.open(str(p))) for p in image_paths]
+        else:
+            # Some/all missing: batch-read from tar.gz in one pass
+            imgs = self._load_images_from_tar(image_paths)
+
         if self._config.to_bgr:
             imgs = [cv2.cvtColor(img, cv2.COLOR_RGB2BGR) for img in imgs]
         results["imgs"] = imgs
         results["img_shape"] = [x.shape[:2] for x in imgs]
         return results
+
+    @staticmethod
+    def _load_images_from_tar(image_paths) -> list:
+        """Batch-load images from tar.gz in a single pass.
+
+        Opens the tar.gz once, reads all needed images, closes.
+        """
+        import io as _io
+        import tarfile
+
+        # Determine episode and tar.gz path from first image path
+        p0 = Path(str(image_paths[0]))
+        parts = p0.parts
+        try:
+            idx = list(parts).index("extracted_sensors")
+        except ValueError:
+            raise FileNotFoundError(f"Cannot locate tar.gz for: {p0}")
+
+        episode = parts[idx + 1]
+        tacarla_root = Path(*parts[:idx])
+
+        tar_path = None
+        for town in ["Town12_sensors", "Town13_sensors"]:
+            candidate = tacarla_root / "data" / "TaCarla" / town / f"{episode}.tar.gz"
+            if candidate.exists():
+                tar_path = candidate
+                break
+        if tar_path is None:
+            raise FileNotFoundError(f"No tar.gz found for episode {episode}")
+
+        # Build lookup: relative suffix -> index in image_paths
+        needed = {}
+        for i, ip in enumerate(image_paths):
+            pp = Path(str(ip)).parts
+            rel = "/".join(pp[idx + 2:])  # detection/rgb_camera/cam/file.jpg
+            needed[rel] = i
+
+        imgs = [None] * len(image_paths)
+
+        # Single pass through tar.gz
+        with tarfile.open(tar_path, "r:gz") as tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+                for rel, i in needed.items():
+                    if imgs[i] is not None:
+                        continue
+                    if member.name.endswith(rel):
+                        f = tf.extractfile(member)
+                        if f is not None:
+                            imgs[i] = np.array(Image.open(_io.BytesIO(f.read())))
+                        break
+                # Stop early if all found
+                if all(img is not None for img in imgs):
+                    break
+
+        for i, img in enumerate(imgs):
+            if img is None:
+                raise FileNotFoundError(f"Image not found in tar.gz: {image_paths[i]}")
+
+        return imgs
 
     def resize_crop_flip_img(self, results, test_mode):
         H, W = self._config.H, self._config.W
